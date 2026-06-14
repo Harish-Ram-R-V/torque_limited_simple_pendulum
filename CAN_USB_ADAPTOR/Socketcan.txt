@@ -1,0 +1,3 @@
+https://docs.influxtechnology.com/support_guides/rexgen-socketcan-driver/readme/socketcan-installation-on-ubuntu
+https://www.youtube.com/watch?v=tqlBv6inzUY
+https://python-can.readthedocs.io/en/stable/?utm_source=chatgpt.com

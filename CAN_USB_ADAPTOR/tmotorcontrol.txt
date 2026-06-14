@@ -1,0 +1,3 @@
+https://github.com/dfki-ric-underactuated-lab/mini-cheetah-tmotor-python-can/blob/main/README.md
+https://pypi.org/project/TMotorCANControl/
+https://github.com/neurobionics/TMotorCANControl/blob/master/README.md
