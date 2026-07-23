@@ -1,0 +1,501 @@
+import can
+import time
+import math
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import threading
+import subprocess
+
+# ── AK70-10 MIT parameters (manual section 5.3, page 63) ──────────────
+MOTOR_ID = 1
+P_MIN,  P_MAX  = -12.5,  12.5    # rad
+V_MIN,  V_MAX  = -50.0,  50.0    # rad/s
+T_MIN,  T_MAX  = -25.0,  25.0    # N·m  ← AK70-10 torque limit
+KP_MIN, KP_MAX =   0.0, 500.0
+KD_MIN, KD_MAX =   0.0,   5.0
+
+# ── Conversion helpers (manual page 66) ────────────────────────────────
+def float_to_uint(x, x_min, x_max, bits):
+    x = max(x_min, min(x_max, x))
+    return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
+
+def uint_to_float(x_int, x_min, x_max, bits):
+    return x_int * (x_max - x_min) / ((1 << bits) - 1) + x_min
+
+# ── Pack MIT command (manual page 60-61) ───────────────────────────────
+def pack_mit(p_des, v_des, kp, kd, t_ff):
+    """
+    For torque control:
+        p_des = 0   (irrelevant, kp=0 so position term is zero)
+        v_des = 0   (irrelevant, kd=0 so velocity term is zero)
+        kp    = 0   (removes position stiffness completely)
+        kd    = 0   (removes velocity damping completely)
+        t_ff  = desired torque in N·m
+
+    MIT equation becomes: τ = t_ff
+    """
+    p_int  = float_to_uint(p_des, P_MIN,  P_MAX,  16)
+    v_int  = float_to_uint(v_des, V_MIN,  V_MAX,  12)
+    kp_int = float_to_uint(kp,    KP_MIN, KP_MAX, 12)
+    kd_int = float_to_uint(kd,    KD_MIN, KD_MAX, 12)
+    t_int  = float_to_uint(t_ff,  T_MIN,  T_MAX,  12)
+    return [
+        (p_int >> 8) & 0xFF,
+         p_int & 0xFF,
+        (v_int >> 4) & 0xFF,
+        ((v_int & 0xF) << 4) | ((kp_int >> 8) & 0xF),
+         kp_int & 0xFF,
+        (kd_int >> 4) & 0xFF,
+        ((kd_int & 0xF) << 4) | ((t_int >> 8) & 0xF),
+         t_int & 0xFF
+    ]
+
+# ── Decode motor reply (manual page 61, 67-68) ─────────────────────────
+def decode_reply(data):
+    """
+    Reply byte layout (manual page 61):
+    [0]      Drive ID
+    [1]      position high 8 bits  (16-bit)
+    [2]      position low  8 bits
+    [3]      velocity high 8 bits  (12-bit)
+    [4][7:4] velocity low  4 bits
+    [4][3:0] torque   high 4 bits  (12-bit)
+    [5]      torque   low  8 bits
+    [6]      temperature (raw - 40 = celsius)
+    [7]      error code
+    """
+    motor_id = data[0]
+    p_int    = (data[1] << 8) | data[2]
+    v_int    = (data[3] << 4) | (data[4] >> 4)
+    i_int    = ((data[4] & 0xF) << 8) | data[5]
+    temp     = data[6] - 40
+    error    = data[7]
+    pos    = uint_to_float(p_int, P_MIN, P_MAX, 16)
+    vel    = uint_to_float(v_int, V_MIN, V_MAX, 12)
+    torque = uint_to_float(i_int, T_MIN, T_MAX, 12)
+    return motor_id, pos, vel, torque, temp, error
+
+ERROR_CODES = {
+    0: "No fault",       1: "Motor over-temp",
+    2: "Over-current",   3: "Over-voltage",
+    4: "Under-voltage",  5: "Encoder fault",
+    6: "FET over-temp",  7: "Motor stall"
+}
+
+# ── CAN setup ───────────────────────────────────────────────────────────
+def reset_can():
+    subprocess.run(["sudo","ip","link","set","can0","down"],
+                   capture_output=True)
+    time.sleep(0.3)
+    subprocess.run(["sudo","ip","link","set","can0","up",
+                    "type","can","bitrate","1000000",
+                    "restart-ms","100"],
+                   capture_output=True)
+    time.sleep(0.2)
+    subprocess.run(["sudo","ip","link","set","can0",
+                    "txqueuelen","1000"],
+                   capture_output=True)
+    time.sleep(0.1)
+
+def send_raw(bus, data):
+    try:
+        bus.send(can.Message(
+            arbitration_id=MOTOR_ID,
+            data=data,
+            is_extended_id=False
+        ), timeout=0.2)
+        return True
+    except Exception:
+        return False
+
+def get_reply(bus, timeout=0.05):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        msg = bus.recv(timeout=remaining)
+        if msg is None:
+            break
+        if (len(msg.data) == 8
+                and not msg.is_extended_id
+                and msg.data[0] == MOTOR_ID
+                and msg.data[0] != 0xFF):
+            return decode_reply(msg.data)
+    return None
+
+def enable_motor(bus):
+    """Special enable code from manual page 60"""
+    send_raw(bus, [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFC])
+    time.sleep(0.1)
+    return get_reply(bus, timeout=1.0)
+
+def disable_motor(bus):
+    """Special disable code from manual page 60"""
+    for _ in range(3):
+        send_raw(bus, [0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFD])
+        time.sleep(0.05)
+
+# ── Shared state ────────────────────────────────────────────────────────
+time_data      = []
+torque_cmd_data  = []    # what we commanded
+torque_act_data  = []    # what motor actually reports
+vel_data       = []
+pos_data       = []
+
+current_torque = 0.0     # current torque command in N·m
+motor_running  = True
+data_lock      = threading.Lock()
+
+# ── Torque ramp ─────────────────────────────────────────────────────────
+def ramp_torque(bus, from_torque, to_torque,
+                ramp_rate=2.0, dt=0.05):
+    """
+    Smoothly ramp torque from from_torque to to_torque.
+
+    ramp_rate = N·m per second.
+    Default 2.0 N·m/s is very gentle.
+
+    Why ramp?
+    Sudden torque jumps cause mechanical shock and can
+    trigger over-current fault (error code 2).
+    A ramp spreads the current rise over time.
+    """
+    global current_torque
+
+    step  = ramp_rate * dt
+    torq  = from_torque
+
+    print(f"  Ramping torque: {from_torque:.3f} → "
+          f"{to_torque:.3f} N·m "
+          f"(rate={ramp_rate} N·m/s)")
+
+    while abs(torq - to_torque) > step / 2:
+        if torq < to_torque:
+            torq = min(torq + step, to_torque)
+        else:
+            torq = max(torq - step, to_torque)
+
+        # Pure torque command: kp=0, kd=0, t_ff=torq
+        cmd = pack_mit(0.0, 0.0, 0.0, 0.0, torq)
+        send_raw(bus, cmd)
+
+        reply = get_reply(bus, timeout=dt)
+        if reply:
+            _, pos, vel, torque_actual, temp, err = reply
+            elapsed = time.time()
+            with data_lock:
+                time_data.append(elapsed)
+                torque_cmd_data.append(torq)
+                torque_act_data.append(torque_actual)
+                vel_data.append(vel)
+                pos_data.append(pos)
+            if err != 0:
+                print(f"\n  [ERROR] {ERROR_CODES.get(err,err)}")
+                return False
+
+        with data_lock:
+            current_torque = torq
+
+        time.sleep(dt)
+
+    with data_lock:
+        current_torque = to_torque
+
+    return True
+
+# ── Hold torque ──────────────────────────────────────────────────────────
+def hold_torque(bus, torque_nm, duration):
+    """
+    Apply a constant torque for duration seconds.
+    Sends the same command at 20Hz (every 50ms).
+
+    The motor WILL move under constant torque unless
+    something is holding it — gravity, a load, a pendulum.
+    Watch the velocity output to see it accelerating.
+    """
+    global current_torque
+
+    print(f"\n  Holding {torque_nm:.3f} N·m for {duration}s")
+    print(f"  {'Time':>6}  {'Cmd(Nm)':>9}  {'Act(Nm)':>9}  "
+          f"{'Vel(rad/s)':>11}  {'Pos(deg)':>9}  {'Temp':>5}")
+    print(f"  {'-'*60}")
+
+    cmd   = pack_mit(0.0, 0.0, 0.0, 0.0, torque_nm)
+    start = time.time()
+
+    while time.time() - start < duration:
+        send_raw(bus, cmd)
+
+        reply = get_reply(bus, timeout=0.02)
+        if reply:
+            _, pos, vel, torque_actual, temp, err = reply
+            elapsed = time.time() - start
+
+            # Store data
+            now = time.time()
+            with data_lock:
+                time_data.append(now)
+                torque_cmd_data.append(torque_nm)
+                torque_act_data.append(torque_actual)
+                vel_data.append(vel)
+                pos_data.append(pos)
+
+            print(f"  {elapsed:>6.2f}  "
+                  f"{torque_nm:>+9.4f}  "
+                  f"{torque_actual:>+9.4f}  "
+                  f"{vel:>+11.4f}  "
+                  f"{math.degrees(pos):>+9.2f}  "
+                  f"{temp:>4}°C",
+                  end='\r')
+
+            if err != 0:
+                print(f"\n  [ERROR] {ERROR_CODES.get(err,err)}")
+                return False
+
+        time.sleep(0.05)
+
+    print()
+    return True
+
+# ── Save plot ───────────────────────────────────────────────────────────
+def save_plot(filename='torque_plot.png'):
+    """
+    Three-panel plot saved to PNG:
+    Top    : commanded vs actual torque
+    Middle : velocity over time
+    Bottom : position over time
+
+    This gives your professor a complete picture of
+    how the motor responded to torque commands.
+    """
+    with data_lock:
+        if len(time_data) < 2:
+            print("  Not enough data to plot.")
+            return
+
+        # Normalise time so x-axis starts at 0
+        t0   = time_data[0]
+        t    = [x - t0 for x in time_data]
+        tc   = list(torque_cmd_data)
+        ta   = list(torque_act_data)
+        vel  = list(vel_data)
+        pos  = [math.degrees(p) for p in pos_data]
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    fig.patch.set_facecolor('#1e1e1e')
+
+    # ── Panel 1: Torque ────────────────────────────────────────────
+    ax1 = axes[0]
+    ax1.set_facecolor('#2d2d2d')
+    ax1.plot(t, tc, color='#FF4444', linewidth=1.5,
+             linestyle='--', label='Commanded torque')
+    ax1.plot(t, ta, color='#FFD700', linewidth=2,
+             label='Actual torque')
+    ax1.axhline(y=0, color='#666666', linewidth=0.8)
+    ax1.set_ylabel('Torque (N·m)', color='white', fontsize=11)
+    ax1.set_title('AK70-10 Torque Control',
+                  color='white', fontsize=14, fontweight='bold')
+    ax1.legend(facecolor='#3d3d3d',
+               labelcolor='white', fontsize=10)
+    ax1.tick_params(colors='white')
+    ax1.grid(True, alpha=0.3, color='#666666')
+    for sp in ax1.spines.values():
+        sp.set_color('#666666')
+
+    # ── Panel 2: Velocity ──────────────────────────────────────────
+    ax2 = axes[1]
+    ax2.set_facecolor('#2d2d2d')
+    ax2.plot(t, vel, color='#00BFFF', linewidth=2,
+             label='Velocity')
+    ax2.axhline(y=0, color='#666666', linewidth=0.8)
+    ax2.set_ylabel('Velocity (rad/s)', color='white', fontsize=11)
+    ax2.legend(facecolor='#3d3d3d',
+               labelcolor='white', fontsize=10)
+    ax2.tick_params(colors='white')
+    ax2.grid(True, alpha=0.3, color='#666666')
+    for sp in ax2.spines.values():
+        sp.set_color('#666666')
+
+    # ── Panel 3: Position ──────────────────────────────────────────
+    ax3 = axes[2]
+    ax3.set_facecolor('#2d2d2d')
+    ax3.plot(t, pos, color='#90EE90', linewidth=2,
+             label='Position')
+    ax3.axhline(y=0, color='#666666', linewidth=0.8)
+    ax3.set_xlabel('Time (s)', color='white', fontsize=11)
+    ax3.set_ylabel('Position (deg)', color='white', fontsize=11)
+    ax3.legend(facecolor='#3d3d3d',
+               labelcolor='white', fontsize=10)
+    ax3.tick_params(colors='white')
+    ax3.grid(True, alpha=0.3, color='#666666')
+    for sp in ax3.spines.values():
+        sp.set_color('#666666')
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150,
+                bbox_inches='tight',
+                facecolor='#1e1e1e')
+    plt.close()
+
+    print(f"  Plot saved → {filename}")
+    print(f"  Copy to laptop:")
+    print(f"  scp l006@172.16.9.183:~/{filename} .")
+
+# ── Input helpers ───────────────────────────────────────────────────────
+def get_float(prompt, min_val, max_val):
+    while True:
+        try:
+            raw = input(prompt).strip()
+            val = float(eval(raw,
+                {"__builtins__": {}},
+                {"pi": math.pi, "sqrt": math.sqrt}))
+            if min_val <= val <= max_val:
+                return val
+            print(f"  Out of range: {min_val} to {max_val}")
+        except Exception:
+            print("  Enter a number.")
+
+def get_yes_no(prompt):
+    while True:
+        ans = input(prompt).strip().lower()
+        if ans in ('y','yes'): return True
+        if ans in ('n','no'):  return False
+        print("  Enter y or n")
+
+# ── Main ────────────────────────────────────────────────────────────────
+def main():
+    print("="*55)
+    print("  AK70-10 MIT Torque Controller")
+    print("="*55)
+    print()
+    print("  How pure torque control works:")
+    print("  MIT equation: τ = kp*(p_des-p) + kd*(v_des-v) + t_ff")
+    print("  Set kp=0, kd=0 → τ = t_ff only")
+    print("  You directly command torque in N·m.")
+    print("  Motor has NO position or velocity control.")
+    print("  It just applies whatever torque you say.")
+    print()
+    print("  AK70-10 torque range: -25.0 to +25.0 N·m")
+    print("  Positive = CCW rotation (when facing shaft)")
+    print("  Negative = CW  rotation")
+    print()
+    print("  SAFETY: start with small values like 0.5 N·m")
+    print("  The motor WILL spin under torque — secure it first")
+    print("="*55)
+
+    # Reset CAN
+    print("\n  Resetting can0...")
+    reset_can()
+    print("  can0 ready")
+
+    # Open bus
+    try:
+        bus = can.interface.Bus(channel='can0', interface='socketcan')
+    except Exception as e:
+        print(f"[FAIL] Cannot open can0: {e}")
+        return
+
+    try:
+        # Enable motor
+        print("\n[1] Enabling motor...")
+        reply = enable_motor(bus)
+        if reply is None:
+            print("[FAIL] No motor reply.")
+            return
+
+        _, pos, vel, torq, temp, err = reply
+        print(f"[OK]  Motor online")
+        print(f"      pos={math.degrees(pos):.2f}°  "
+              f"vel={vel:.3f}rad/s  "
+              f"temp={temp}°C  "
+              f"status={ERROR_CODES.get(err,err)}")
+
+        # ── Main torque control loop ────────────────────────────────
+        print("\n" + "="*55)
+        print("  Enter torque commands.")
+        print("  Type 'quit' to stop and save plot.")
+        print("  Range: -25.0 to +25.0 N·m")
+        print("  START SMALL — try 0.5 first")
+        print("="*55 + "\n")
+
+        while True:
+            with data_lock:
+                cur = current_torque
+
+            print(f"\n  Current torque command: {cur:+.3f} N·m")
+
+            raw = input(
+                "  Target torque (N·m) or 'quit': ").strip()
+
+            if raw.lower() in ('quit','q','exit'):
+                break
+
+            try:
+                target = float(eval(raw,
+                    {"__builtins__": {}},
+                    {"pi": math.pi, "sqrt": math.sqrt}))
+            except Exception:
+                print("  Invalid. Enter a number like 0.5 or -1.2")
+                continue
+
+            if not (T_MIN <= target <= T_MAX):
+                print(f"  Out of range: {T_MIN} to {T_MAX} N·m")
+                continue
+
+            # Duration to hold this torque
+            duration = get_float(
+                f"  Hold {target:+.3f} N·m for how many seconds? "
+                f"(0.5 to 30): ",
+                0.5, 30.0
+            )
+
+            # Safety warning for large torques
+            if abs(target) > 5.0:
+                print(f"\n  [WARN] {abs(target):.1f} N·m is "
+                      f"significant torque.")
+                print("  Make sure motor is secured.")
+                if not get_yes_no("  Continue? (y/n): "):
+                    continue
+
+            # Ramp to target torque smoothly
+            ok = ramp_torque(bus,
+                             from_torque=cur,
+                             to_torque=target,
+                             ramp_rate=2.0)
+            if not ok:
+                print("  Motor error during ramp — stopping")
+                break
+
+            # Hold at target torque
+            ok = hold_torque(bus, target, duration)
+            if not ok:
+                print("  Motor error during hold — stopping")
+                break
+
+            if not get_yes_no(
+                    "\n  Apply another torque? (y/n): "):
+                break
+
+        # Ramp back to zero before disabling
+        with data_lock:
+            cur = current_torque
+
+        if abs(cur) > 0.1:
+            print(f"\n  Ramping to zero from {cur:+.3f} N·m...")
+            ramp_torque(bus,
+                        from_torque=cur,
+                        to_torque=0.0,
+                        ramp_rate=2.0)
+
+    finally:
+        print("\n[2] Disabling motor...")
+        disable_motor(bus)
+        bus.shutdown()
+        print("  Motor disabled.")
+        print("\n[3] Saving plot...")
+        save_plot('torque_plot.png')
+
+if __name__ == "__main__":
+    main()
